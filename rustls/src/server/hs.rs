@@ -429,7 +429,7 @@ impl ExpectClientHello {
 impl State<ServerConnectionData> for ExpectClientHello {
     fn handle(self: Box<Self>, cx: &mut ServerContext<'_>, m: Message) -> NextStateOrError {
         let (client_hello, sig_schemes) =
-            process_client_hello(&m, self.done_retry, cx.common, cx.data)?;
+            process_client_hello(&m, self.done_retry, cx.common, cx.data, self.config.clone())?;
         self.with_certified_key(sig_schemes, client_hello, &m, cx)
     }
 }
@@ -446,6 +446,7 @@ pub(super) fn process_client_hello<'a>(
     done_retry: bool,
     common: &mut CommonState,
     data: &mut ServerConnectionData,
+    config: Arc<ServerConfig>,
 ) -> Result<(&'a ClientHelloPayload, Vec<SignatureScheme>), Error> {
     let client_hello =
         require_handshake_msg!(m, HandshakeType::ClientHello, HandshakePayload::ClientHello)?;
@@ -508,21 +509,18 @@ pub(super) fn process_client_hello<'a>(
     // orthogonally to offered ciphersuites (even though, in TLS1.2 it is not).
     // So: reduce the offered sigschemes to those compatible with the
     // intersection of ciphersuites.
-    let client_suites = ALL_CIPHER_SUITES
-        .iter()
-        .copied()
-        .filter(|scs| {
-            client_hello
-                .cipher_suites
-                .contains(&scs.suite())
-        })
-        .collect::<Vec<_>>();
+    let mut common_suites = config.cipher_suites.clone();
+    common_suites.retain(|scs| {
+        client_hello
+            .cipher_suites
+            .contains(&scs.suite())
+    });
 
     let mut sig_schemes = client_hello
         .get_sigalgs_extension()
         .ok_or_else(|| incompatible(common, "client didn't describe signature schemes"))?
         .clone();
-    sig_schemes.retain(|scheme| suites::compatible_sigscheme_for_suites(*scheme, &client_suites));
+    sig_schemes.retain(|scheme| suites::compatible_sigscheme_for_suites(*scheme, &common_suites));
 
     Ok((client_hello, sig_schemes))
 }
