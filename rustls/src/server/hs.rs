@@ -428,8 +428,13 @@ impl ExpectClientHello {
 
 impl State<ServerConnectionData> for ExpectClientHello {
     fn handle(self: Box<Self>, cx: &mut ServerContext<'_>, m: Message) -> NextStateOrError {
-        let (client_hello, sig_schemes) =
-            process_client_hello(&m, self.done_retry, cx.common, cx.data, self.config.clone())?;
+        let (client_hello, sig_schemes) = process_client_hello2(
+            &m,
+            self.done_retry,
+            cx.common,
+            cx.data,
+            self.config.as_ref(),
+        )?;
         self.with_certified_key(sig_schemes, client_hello, &m, cx)
     }
 }
@@ -446,7 +451,94 @@ pub(super) fn process_client_hello<'a>(
     done_retry: bool,
     common: &mut CommonState,
     data: &mut ServerConnectionData,
-    config: Arc<ServerConfig>,
+) -> Result<(&'a ClientHelloPayload, Vec<SignatureScheme>), Error> {
+    let client_hello =
+        require_handshake_msg!(m, HandshakeType::ClientHello, HandshakePayload::ClientHello)?;
+    trace!("we got a clienthello {:?}", client_hello);
+
+    if !client_hello
+        .compression_methods
+        .contains(&Compression::Null)
+    {
+        common.send_fatal_alert(AlertDescription::IllegalParameter);
+        return Err(Error::PeerIncompatibleError(
+            "client did not offer Null compression".to_string(),
+        ));
+    }
+
+    if client_hello.has_duplicate_extension() {
+        return Err(decode_error(common, "client sent duplicate extensions"));
+    }
+
+    // No handshake messages should follow this one in this flight.
+    common.check_aligned_handshake()?;
+
+    // Extract and validate the SNI DNS name, if any, before giving it to
+    // the cert resolver. In particular, if it is invalid then we should
+    // send an Illegal Parameter alert instead of the Internal Error alert
+    // (or whatever) that we'd send if this were checked later or in a
+    // different way.
+    let sni: Option<webpki::DnsName> = match client_hello.get_sni_extension() {
+        Some(sni) => {
+            if sni.has_duplicate_names_for_type() {
+                return Err(decode_error(
+                    common,
+                    "ClientHello SNI contains duplicate name types",
+                ));
+            }
+
+            if let Some(hostname) = sni.get_single_hostname() {
+                Some(hostname.into())
+            } else {
+                return Err(common.illegal_param("ClientHello SNI did not contain a hostname"));
+            }
+        }
+        None => None,
+    };
+
+    // save only the first SNI
+    if let (Some(sni), false) = (&sni, done_retry) {
+        // Save the SNI into the session.
+        // The SNI hostname is immutable once set.
+        assert!(data.sni.is_none());
+        data.sni = Some(sni.clone())
+    } else if data.sni != sni {
+        return Err(Error::PeerIncompatibleError(
+            "SNI differed on retry".to_string(),
+        ));
+    }
+
+    // We communicate to the upper layer what kind of key they should choose
+    // via the sigschemes value.  Clients tend to treat this extension
+    // orthogonally to offered ciphersuites (even though, in TLS1.2 it is not).
+    // So: reduce the offered sigschemes to those compatible with the
+    // intersection of ciphersuites.
+    let client_suites = ALL_CIPHER_SUITES
+        .iter()
+        .copied()
+        .filter(|scs| {
+            client_hello
+                .cipher_suites
+                .contains(&scs.suite())
+        })
+        .collect::<Vec<_>>();
+
+    let mut sig_schemes = client_hello
+        .get_sigalgs_extension()
+        .ok_or_else(|| incompatible(common, "client didn't describe signature schemes"))?
+        .clone();
+    sig_schemes.retain(|scheme| suites::compatible_sigscheme_for_suites(*scheme, &client_suites));
+
+    Ok((client_hello, sig_schemes))
+}
+
+/// Quickfix hack
+fn process_client_hello2<'a>(
+    m: &'a Message,
+    done_retry: bool,
+    common: &mut CommonState,
+    data: &mut ServerConnectionData,
+    config: &ServerConfig,
 ) -> Result<(&'a ClientHelloPayload, Vec<SignatureScheme>), Error> {
     let client_hello =
         require_handshake_msg!(m, HandshakeType::ClientHello, HandshakePayload::ClientHello)?;
